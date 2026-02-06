@@ -34,11 +34,12 @@ const (
 	RECOMMEND_CONFIG              = "RECOMMEND_CONFIG"
 )
 
+// Model 模型元信息
 type Model[T any] struct {
-	ID     int64
-	Type   string
-	Params model.Params
-	Score  T
+	ID     int64        // 模型标识
+	Type   string       // 模型类型
+	Params model.Params // 模型参数
+	Score  T            // 模型得分，训练/搜索时的指标
 }
 
 func (m *Model[T]) ToJSON() string {
@@ -54,6 +55,8 @@ func (m *Model[T]) Equal(other Model[T]) bool {
 	return m.Type == other.Type && maps.Equal(m.Params, other.Params)
 }
 
+// Node 集群中的节点实例(master/server/worker)
+// 用于心跳/注册与节点列表管理
 type Node struct {
 	UUID       string
 	Hostname   string
@@ -62,17 +65,30 @@ type Node struct {
 	UpdateTime time.Time
 }
 
+// Database 抽象集群使用的元数据存储，同目录下有sqlite的实现
+// sqlite实现中，有这些表:
+// - nodes: 节点信息
+// - cron_jobs: 定时任务
+// - key_values: 键值对(模型配置、训练结果、推荐配置)
+// 总之定义各种系统级元信息
 type Database interface {
+	// Close 释放数据库持有的资源。
 	Close() error
+	// Init 初始化所需的表和索引。
 	Init() error
+	// UpdateNode 更新或插入节点心跳与元数据。
 	UpdateNode(node *Node) error
+	// ListNodes 返回所有已注册的节点。
 	ListNodes() ([]*Node, error)
+	// Put 根据 key 存储字符串值。
 	Put(key, value string) error
+	// Get 根据 key 获取值；不存在时返回 nil。
 	Get(key string) (*string, error)
+	// Delete 删除指定 key 及其值。
 	Delete(key string) error
 }
 
-// Open a connection to a database.
+// Open 打开数据库连接。
 func Open(path string, ttl time.Duration) (Database, error) {
 	var err error
 	if strings.HasPrefix(path, storage.SQLitePrefix) {
