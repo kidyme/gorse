@@ -32,6 +32,8 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+// Store 抽象二进制文件存储，同目录下有s3/gcs/azure/posix的实现
+// 可考虑直接本地存取
 type Store interface {
 	Open(name string) (io.ReadCloser, error)
 	Create(name string) (io.WriteCloser, chan struct{}, error)
