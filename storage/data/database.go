@@ -228,6 +228,15 @@ func NewScanOptions(opts ...ScanOption) ScanOptions {
 	return options
 }
 
+// Database 抽象业务数据存储，同目录下有sql的实现
+// sql实现中，有这些表:
+// - items: 物品信息
+// - users: 用户信息
+// - feedback: 反馈信息
+// - aggregating_feedback: 聚合反馈信息
+// - user_feedback: 用户反馈信息
+// - item_feedback: 物品反馈信息
+// - latest_items: 最新物品信息
 type Database interface {
 	Init() error
 	Ping() error
