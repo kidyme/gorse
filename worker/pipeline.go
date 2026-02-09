@@ -50,6 +50,8 @@ type Pipeline struct {
 	dontskipColdStartUsers   bool
 }
 
+// progress用于向master上报进度
+// worker侧离线推荐的主入口：给一批用户生成推荐结果并写入缓存，同时记录进度与监控指标。
 func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress func(completed, throughput int)) {
 	startRecommendTime := time.Now()
 	itemCache := NewItemCache(p.DataClient)
@@ -63,6 +65,7 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 	_, span := p.Tracer.Start(ctx, "Generate recommendation", len(users))
 	defer span.End()
 
+	// 每隔10秒，通过completedCount - previousCount，来计算当前的吞吐量
 	go func() {
 		defer util.CheckPanic()
 		completedCount, previousCount := 0, 0
@@ -107,6 +110,7 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 		user := users[jobId]
 		userId := user.UserId
 		// skip inactive users before max recommend period
+		// 如果  用户不活跃 / 不需要重算 ，则不进行重建推荐
 		if !p.checkUserActiveTime(ctx, userId) || !p.checkRecommendCacheOutOfDate(ctx, userId) {
 			return
 		}
@@ -118,14 +122,20 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 			log.Logger().Error("failed to create recommender", zap.String("user_id", userId), zap.Error(err))
 			return
 		}
+
+		// 若允许冷启动且该用户配置了冷启动，则不进行重建推荐
 		if !p.dontskipColdStartUsers && recommender.IsColdStart() {
 			// skip cold-start users without any positive feedback
 			return
 		}
 
+		// **CF-MF(矩阵分解)，这里基于master侧算出来的item和user向量结果进行详细检索，写入CF推荐缓存，后面的MF(CF)推荐器会用到
+		// MatrixFactorizationUsers和MatrixFactorizationItems是一个worker实例下全局的矩阵分解结果
 		// Update collaborative filtering recommendation.
+		// 如果Collaborative的type不是none且uesr和item的矩阵分解都存在
 		if !strings.EqualFold(p.Config.Recommend.Collaborative.Type, "none") && p.MatrixFactorizationUsers != nil && p.MatrixFactorizationItems != nil {
 			if userEmbedding, ok := p.MatrixFactorizationUsers.Get(userId); ok {
+				// 有用户向量：更新 CF 推荐缓存；后续仍会继续走其他推荐器
 				err = p.updateCollaborativeRecommend(ctx, p.MatrixFactorizationItems, userId, userEmbedding, recommender.ExcludeSet(), itemCache)
 				if err != nil {
 					log.Logger().Error("failed to recommend by collaborative filtering",
@@ -133,6 +143,8 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 					return
 				}
 			} else if !p.dontskipColdStartUsers {
+				// 无用户向量且允许跳过冷启动：直接返回，不再走后续推荐流程
+				// 可能原因：行为过少或模型尚未生成向量
 				// skip users without collaborative filtering embeddings
 				return
 			}
@@ -144,11 +156,15 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 			digest           string
 			recommenderNames []string
 		)
+		// 推荐器列表 虽然是Ranker.Recommenders，但实际是召回模块的
 		if len(p.Config.Recommend.Ranker.Recommenders) > 0 {
 			recommenderNames = p.Config.Recommend.Ranker.Recommenders
 		} else {
+			// 默认的推荐器列表
 			recommenderNames = p.Config.Recommend.ListRecommenders()
 		}
+		// 按推荐器列表顺序执行，返回候选分数及配置摘要
+		// ** scores 召回结果
 		scores, digest, err = recommender.RecommendSequential(ctx, scores, 0, recommenderNames...)
 		if err != nil {
 			log.Logger().Error("failed to recommend items", zap.String("user_id", userId), zap.Error(err))
@@ -157,6 +173,7 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 
 		candidates := make([]cache.Score, 0, len(scores))
 		candidateSet := mapset.NewSet[string]()
+		// 批量拉取候选物品的元数据，用于过滤不存在的物品
 		items, err := itemCache.GetMap(ctx, lo.Map(scores, func(score cache.Score, _ int) string {
 			return score.Id
 		}))
@@ -172,9 +189,11 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 			}
 		}
 
+		// 如果启用替换，先把替换候选加入候选集，便于统一排序
 		// Insert replacement items into the candidate set before ranking so all rankers (including LLM) can order them.
 		var replacementPositiveItems, replacementNegativeItems mapset.Set[string]
 		if p.Config.Recommend.Replacement.EnableReplacement && p.Config.Recommend.Ranker.Type != "none" {
+			// 追加替换候选，并记录正/负反馈替换集合供后续衰减
 			candidates, replacementPositiveItems, replacementNegativeItems, err = p.addReplacementCandidates(
 				ctx, candidates, candidateSet, recommender.UserFeedback(), itemCache, recommendTime,
 			)
@@ -184,20 +203,24 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 			}
 		}
 
+		// 根据配置选择排序：CTR 模型 / LLM / 原始顺序
 		// rank by click-through-rate
 		var results []cache.Score
 		if p.Config.Recommend.Ranker.Type == "fm" && p.ClickThroughRateModel != nil && !p.ClickThroughRateModel.Invalid() {
+			// FM/CTR 排序模型
 			results, err = p.rankByClickTroughRate(ctx, p.ClickThroughRateModel, &user, candidates, itemCache, recommendTime)
 			if err != nil {
 				log.Logger().Error("failed to rank items", zap.Error(err))
 				return
 			}
 		} else if p.Config.Recommend.Ranker.Type == "llm" && p.Config.Recommend.Ranker.Prompt != "" && p.Config.OpenAI.ChatCompletionModel != "" {
+			// 基于 LLM 的排序器
 			ranker, err := logics.NewChatRanker(p.Config.OpenAI, p.Config.Recommend.Ranker.Prompt)
 			if err != nil {
 				log.Logger().Error("failed to create LLM ranker", zap.Error(err))
 				return
 			}
+			// 让 LLM 对候选进行重排序
 			results, err = p.rankByLLM(ctx, pCtx, ranker, &user, recommender.UserFeedback(), candidates, itemCache, recommendTime)
 			if err != nil {
 				log.Logger().Error("failed to rank items by LLM", zap.Error(err))
@@ -207,16 +230,21 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 			results = candidates
 		}
 
+		// 排序后应用替换衰减，避免替换权重绕过排序结果
 		// Apply replacement decay after ranking so weights don't bypass the ranker ordering.
 		if p.Config.Recommend.Replacement.EnableReplacement && p.Config.Recommend.Ranker.Type != "none" {
+			// 对替换项做衰减，避免其权重影响最终排序
 			results = p.applyReplacementDecay(results, replacementPositiveItems, replacementNegativeItems)
 		}
 
+		// 写入最终推荐结果到缓存
 		// cache recommendation
+		// 写入最终推荐结果
 		if err = p.CacheClient.AddScores(ctx, cache.Recommend, userId, results); err != nil {
 			log.Logger().Error("failed to cache recommendation", zap.Error(err))
 			return
 		}
+		// 清理该用户旧的推荐结果（避免累积）
 		if err = p.CacheClient.DeleteScores(ctx, []string{cache.Recommend}, cache.ScoreCondition{
 			Before: &recommendTime,
 			Subset: proto.String(userId),
@@ -246,6 +274,7 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 }
 
 // checkUserActiveTime checks if a user is active based on their last modification time.
+// ActiveUserTTL内有用户行为，视为活跃
 func (p *Pipeline) checkUserActiveTime(ctx context.Context, userId string) bool {
 	if p.Config.Recommend.ActiveUserTTL == 0 {
 		return true
@@ -272,6 +301,13 @@ func (p *Pipeline) checkUserActiveTime(ctx context.Context, userId string) bool 
 }
 
 // checkRecommendCacheOutOfDate checks if recommend cache stale.
+// 判断用户的推荐缓存是否过期/需要重算
+
+// 满足以下任意条件，则认为推荐缓存过期/需要重算(return true)：
+// 推荐列表为空：SearchScores 返回空
+// 推荐摘要为空或与当前配置的 p.Config.Recommend.Hash() 不一致（配置变了）
+// 推荐更新时间为空
+// 用户最近活跃时间在推荐更新时间之后（说明用户有新行为，缓存旧了）
 func (p *Pipeline) checkRecommendCacheOutOfDate(ctx context.Context, userId string) bool {
 	var (
 		activeTime    time.Time
@@ -336,8 +372,12 @@ func (p *Pipeline) updateCollaborativeRecommend(
 	itemCache *ItemCache,
 ) error {
 	localStartTime := time.Now()
+
+	// 用用户向量在物品向量索引里检索相似物品，先取 CacheSize + excludeSet 数量 的候选，给后面过滤留余量(但实际不会把所有excludeSet都查出来，所以数量会>=CacheSize，但后面用这个recommend的cache的时候是查前CacheSize个)
 	scores := items.Search(userEmbedding, p.Config.Recommend.CacheSize+excludeSet.Cardinality())
+
 	// update categories
+	// 拉取候选物品的元数据
 	itemsMap, err := itemCache.GetMap(ctx, lo.Map(scores, func(score cache.Score, _ int) string {
 		return score.Id
 	}))
@@ -347,6 +387,7 @@ func (p *Pipeline) updateCollaborativeRecommend(
 	// remove excluded items and non-existing items
 	recommend := make([]cache.Score, 0, len(scores))
 	for i := range scores {
+		// 过滤掉 不存在或者excludeSet中的物品
 		if item, exist := itemsMap[scores[i].Id]; exist && !excludeSet.Contains(item.ItemId) {
 			recommend = append(recommend, cache.Score{
 				Id:         scores[i].Id,
@@ -359,10 +400,13 @@ func (p *Pipeline) updateCollaborativeRecommend(
 			})
 		}
 	}
+
+	// add，实际是upsert，比如redis底层用的hset
 	if err := p.CacheClient.AddScores(ctx, cache.CollaborativeFiltering, userId, recommend); err != nil {
 		log.Logger().Error("failed to cache collaborative filtering recommendation result", zap.String("user_id", userId), zap.Error(err))
 		return errors.Trace(err)
 	}
+	// 记录本次CF的元数据，比如更新时间和哈希，后续判断是否过期或者需要重算
 	if err := p.CacheClient.Set(ctx,
 		cache.Time(cache.Key(cache.CollaborativeFilteringUpdateTime, userId), localStartTime),
 		cache.String(cache.Key(cache.CollaborativeFilteringDigest, userId), p.Config.Recommend.Collaborative.Hash(&p.Config.Recommend)),
@@ -370,6 +414,8 @@ func (p *Pipeline) updateCollaborativeRecommend(
 		log.Logger().Error("failed to cache collaborative filtering recommendation time", zap.String("user_id", userId), zap.Error(err))
 		return errors.Trace(err)
 	}
+
+	// 清理before localStartTime的cache
 	if err := p.CacheClient.DeleteScores(ctx, []string{cache.CollaborativeFiltering}, cache.ScoreCondition{Before: &localStartTime, Subset: proto.String(userId)}); err != nil {
 		log.Logger().Error("failed to delete stale collaborative filtering recommendation result", zap.String("user_id", userId), zap.Error(err))
 		return errors.Trace(err)

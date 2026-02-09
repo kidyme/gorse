@@ -56,6 +56,7 @@ type RecommenderFunc func(ctx context.Context) ([]cache.Score, string, error)
 
 func NewRecommender(config config.RecommendConfig, cacheClient cache.Database, dataClient data.Database, online bool, userId string, categories []string) (*Recommender, error) {
 	// Load user feedback
+	// 加载用户反馈记录(用户行为)
 	userFeedback, err := dataClient.GetUserFeedback(context.Background(), userId, lo.ToPtr(time.Now()))
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -63,9 +64,14 @@ func NewRecommender(config config.RecommendConfig, cacheClient cache.Database, d
 	excludeSet := mapset.NewSet[string]()
 	coldstart := true
 	for _, feedback := range userFeedback {
+		// 决定是否把用户已反馈过的物品加入排除集合
+		// 如果没有启用放回 或者 不是在线推荐，则把用户已反馈过的物品加入排除集合，以避免重复推荐
 		if !config.Replacement.EnableReplacement || !online {
 			excludeSet.Add(feedback.ItemId)
 		}
+
+		// 如果当前反馈是正反馈(PositiveFeedbackTypes)，说明用户有过正反馈，则不冷启动
+		// 只要用户有过正反馈行为，就说明用户已有偏好信号，不再属于冷启动用户。这样后续推荐可以使用用户历史行为来推荐
 		if expression.MatchFeedbackTypeExpressions(config.DataSource.PositiveFeedbackTypes, feedback.FeedbackType, feedback.Value) {
 			coldstart = false
 		}
@@ -126,6 +132,7 @@ func (r *Recommender) Recommend(ctx context.Context, limit int) (result []cache.
 func (r *Recommender) RecommendSequential(ctx context.Context, result []cache.Score, limit int, names ...string) ([]cache.Score, string, error) {
 	var digests []string
 	for _, name := range names {
+		// 通过推荐器名 parse 推荐器func
 		recommenderFunc, err := r.parse(name)
 		if err != nil {
 			return nil, "", errors.Trace(err)
@@ -134,11 +141,14 @@ func (r *Recommender) RecommendSequential(ctx context.Context, result []cache.Sc
 		if err != nil {
 			return nil, "", errors.Trace(err)
 		}
+		// 后续推荐器会过滤掉已推荐的
 		for _, score := range scores {
 			r.excludeSet.Add(score.Id)
 		}
 		result = append(result, scores...)
 		digests = append(digests, digest)
+
+		// 若配置了limit，且结果数量>=limit，则返回前 limit条
 		if limit > 0 && len(result) >= limit {
 			return result[:limit], util.MD5(digests...), nil
 		}
@@ -168,6 +178,7 @@ func (r *Recommender) parse(fullname string) (RecommenderFunc, error) {
 	}
 }
 
+// ** 推荐最新 推荐器
 func (r *Recommender) recommendLatest(ctx context.Context) ([]cache.Score, string, error) {
 	items, err := r.dataClient.GetLatestItems(ctx, r.config.CacheSize, r.categories)
 	if err != nil {
@@ -186,6 +197,8 @@ func (r *Recommender) recommendLatest(ctx context.Context) ([]cache.Score, strin
 	return scores, "latest", nil
 }
 
+// ** 非个性化推荐器
+// 传 name，根据name选择推荐哪个榜单/分区(subset)
 func (r *Recommender) recommendNonPersonalized(name string) RecommenderFunc {
 	return func(ctx context.Context) ([]cache.Score, string, error) {
 		var categories []string
@@ -211,8 +224,10 @@ func (r *Recommender) recommendNonPersonalized(name string) RecommenderFunc {
 	}
 }
 
+// ** CF(MF)推荐器
 func (r *Recommender) recommendCollaborative(ctx context.Context) ([]cache.Score, string, error) {
 	// fetch items from cache
+	// 从前面CF算出来的
 	items, err := r.cacheClient.SearchScores(ctx, cache.CollaborativeFiltering, r.userId, r.categories, 0, r.config.CacheSize)
 	if err != nil {
 		return nil, "", errors.Trace(err)
@@ -228,24 +243,34 @@ func (r *Recommender) recommendCollaborative(ctx context.Context) ([]cache.Score
 	}), digest, nil
 }
 
+// ** item2item 推荐器
 func (r *Recommender) recommendItemToItem(name string) RecommenderFunc {
 	return func(ctx context.Context) ([]cache.Score, string, error) {
 		// filter positive feedbacks
+		// 按时间顺序sort反馈
 		data.SortFeedbacks(r.userFeedback)
 		userFeedback := make([]data.Feedback, 0, r.config.CacheSize)
 		for _, feedback := range r.userFeedback {
+			// 实时推荐时，只使用前ContextSize个反馈，防止实时性不够
 			if r.online && r.config.ContextSize <= len(userFeedback) {
 				break
 			}
 			if expression.MatchFeedbackTypeExpressions(r.config.DataSource.PositiveFeedbackTypes, feedback.FeedbackType, feedback.Value) {
+				// 正反馈
 				userFeedback = append(userFeedback, feedback)
 			}
 		}
 		// collect scores
 		scores := make(map[string]float64)
 		categories := make(map[string][]string)
-		digests := mapset.NewSet[string]()
+		digests := mapset.NewSet[string]() // 摘要，主要用于判断是否过期或者需要重算
+
+		// 对每个正反馈物品，获取相似物品TopK，后面再对所有这些topK的总和再取一个topK
+		// 可能会有强势物品权重过大，影响其他物品的推荐效果
+		// ** 考虑对正反馈的物品的贡献做归一化/衰减（例如除以其相似项数量）。
 		for _, feedback := range userFeedback {
+			// 该正反馈物品的相似物品 TopK
+			// 具体的相似度的计算，在master侧的updateItemToItem里实现，使用HNSW，这里只是读出topK
 			similarItems, err := r.cacheClient.SearchScores(ctx, cache.ItemToItem, cache.Key(name, feedback.ItemId), r.categories, 0, r.config.CacheSize)
 			if err != nil {
 				return nil, "", errors.Trace(err)
@@ -264,9 +289,12 @@ func (r *Recommender) recommendItemToItem(name string) RecommenderFunc {
 		}
 		// collect top scores
 		filter := heap.NewTopKFilter[string, float64](r.config.CacheSize)
+		// 利用heap维护topK
 		for id, score := range scores {
 			filter.Push(id, score)
 		}
+
+		// popAll获取topK
 		elems := filter.PopAll()
 		return lo.Map(elems, func(elem heap.Elem[string, float64], _ int) cache.Score {
 			return cache.Score{
@@ -278,10 +306,12 @@ func (r *Recommender) recommendItemToItem(name string) RecommenderFunc {
 	}
 }
 
+// ** user2user 推荐器
 func (r *Recommender) recommendUserToUser(name string) RecommenderFunc {
 	return func(ctx context.Context) ([]cache.Score, string, error) {
 		scores := make(map[string]float64)
 		// load similar users
+		// 查询TopK的相似用户
 		similarUsers, err := r.cacheClient.SearchScores(ctx, cache.UserToUser, cache.Key(name, r.userId), nil, 0, r.config.CacheSize)
 		if err != nil {
 			return nil, "", errors.Trace(err)
@@ -294,6 +324,8 @@ func (r *Recommender) recommendUserToUser(name string) RecommenderFunc {
 		// aggregate scores
 		for _, user := range similarUsers {
 			// load historical feedback
+			// 获取这些用户的历史正反馈
+			// todo 这里似乎没有限制正反馈条数，考虑限制?(条数、时间窗口)
 			feedbacks, err := r.dataClient.GetUserFeedback(ctx, user.Id, lo.ToPtr(time.Now()), r.config.DataSource.PositiveFeedbackTypes...)
 			if err != nil {
 				return nil, "", errors.Trace(err)
@@ -307,9 +339,11 @@ func (r *Recommender) recommendUserToUser(name string) RecommenderFunc {
 		}
 		// collect top k
 		filter := heap.NewTopKFilter[string, float64](r.config.CacheSize)
+		// 利用heap维护topK
 		for id, score := range scores {
 			filter.Push(id, score)
 		}
+		// popAll获取topK
 		elems := filter.PopAll()
 		// filter by categories
 		results := make([]cache.Score, 0, len(elems))
@@ -337,6 +371,8 @@ func (r *Recommender) recommendUserToUser(name string) RecommenderFunc {
 	}
 }
 
+// ** 外部推荐器
+// todo read
 func (r *Recommender) recommendExternal(name string) RecommenderFunc {
 	return func(ctx context.Context) ([]cache.Score, string, error) {
 		var externalConfig config.ExternalConfig

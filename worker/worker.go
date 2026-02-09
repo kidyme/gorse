@@ -137,6 +137,8 @@ func (w *Worker) Sync() {
 	for {
 		var meta *protocol.Meta
 		var err error
+
+		// 从master的rpc服务里获取meta数据
 		if meta, err = w.masterClient.GetMeta(context.Background(),
 			&protocol.NodeInfo{
 				NodeType:      protocol.NodeType_Worker,
@@ -149,6 +151,7 @@ func (w *Worker) Sync() {
 		}
 
 		// load master config
+		// 解析meta数据到config
 		err = json.Unmarshal([]byte(meta.Config), &w.Config)
 		if err != nil {
 			log.Logger().Error("failed to parse master config", zap.Error(err))
@@ -156,6 +159,7 @@ func (w *Worker) Sync() {
 		}
 
 		// connect to data store
+		// data连接
 		if w.dataPath != w.Config.Database.DataStore || w.dataPrefix != w.Config.Database.DataTablePrefix {
 			if strings.HasPrefix(w.Config.Database.DataStore, storage.SQLitePrefix) {
 				log.Logger().Info("connect data store via master")
@@ -174,6 +178,7 @@ func (w *Worker) Sync() {
 		}
 
 		// connect to cache store
+		// cache连接
 		if w.cachePath != w.Config.Database.CacheStore || w.cachePrefix != w.Config.Database.CacheTablePrefix {
 			if strings.HasPrefix(w.Config.Database.CacheStore, storage.SQLitePrefix) {
 				log.Logger().Info("connect cache store via master")
@@ -192,6 +197,7 @@ func (w *Worker) Sync() {
 		}
 
 		// connect to blob store
+		// blob连接
 		nextBlobConfig = w.Config.Blob
 		if w.blobConfig != nextBlobConfig.URI {
 			w.blobStore, err = blob.NewStore(w.Config.Blob, w.conn)
@@ -204,6 +210,8 @@ func (w *Worker) Sync() {
 
 		// synchronize collaborative filtering model
 		w.latestCollaborativeFilteringModelId = meta.CollaborativeFilteringModelId
+		// 判断CF模型是否有更新，有更新则通知syncedChan
+		// 通过lastestID是否大于目前的ID来判断
 		if w.latestCollaborativeFilteringModelId > w.collaborativeFilteringModelId {
 			log.Logger().Info("new ranking model found",
 				zap.Int64("old_version", w.collaborativeFilteringModelId),
@@ -216,6 +224,7 @@ func (w *Worker) Sync() {
 		}
 
 		// synchronize click-through rate model
+		// 判断CTR模型是否有更新，有更新则通知syncedChan
 		w.latestClickThroughRateModelId = meta.ClickThroughRateModelId
 		if w.latestClickThroughRateModelId > w.clickThroughRateModelId {
 			log.Logger().Info("new click model found",
@@ -234,6 +243,7 @@ func (w *Worker) Sync() {
 		if w.testMode {
 			return
 		}
+		// 睡眠一段时间后继续循环
 		time.Sleep(w.Config.Master.MetaTimeout)
 	}
 }
@@ -360,6 +370,7 @@ func (w *Worker) Serve() {
 
 	loop := func() {
 		// pull users
+		// 从全量用户中，通过一致性哈希拉取当前节点负责的用户
 		workingUsers, err := w.pullUsers(w.peers, w.me)
 		if err != nil {
 			log.Logger().Error("failed to split users", zap.Error(err),

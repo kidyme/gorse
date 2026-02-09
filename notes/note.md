@@ -49,4 +49,39 @@ client/：客户端配置、示例、测试脚本。
 - 可选启用 OIDC：初始化 provider/verifier、OAuth2 配置与 token 缓存。
 - 启动 HTTP 服务：REST API 与 Dashboard（`StartHttpServer()`）。
 
-代码路径：`master/master.go` 
+代码路径：`master/master.go`
+
+## 模型
+
+### CF、协同过滤
+
+用于召回
+
+### CTR
+
+CTR 本身不是一种模型，而是一个评估指标，全称为 Click-Through Rate(点击率)
+
+CTR 模型通常是指用于预测用户点击概率的机器学习模型，即 CTR 预估模型(CTR Prediction Model)
+
+用于排序，项目里的CTR用的是AFM模型
+
+## 推荐器流
+
+MF（协同过滤）：
+master 侧训练得到 user/item 向量；worker 侧用 用户向量在物品向量索引中检索 TopK，生成 CF 推荐缓存（CollaborativeFiltering）。推荐器使用时只是读取这个缓存。
+item2item：
+master 侧按配置类型（embedding/tags/users/auto）离线计算每个物品的相似 TopK 并缓存（ItemToItem）。在线推荐时，对用户的每个正反馈物品 读取其相似 TopK 并累加分数，再取全局 TopK。
+user2user：
+master 侧按配置类型（embedding/tags/items/auto）离线计算每个用户的相似 TopK 并缓存（UserToUser）。在线推荐时，先取相似用户，再汇总这些用户的正反馈物品并取 TopK。
+这样既区分了“离线计算/在线读取”，也说明了不同类型不一定是向量相似。
+
+### 为什么CF推荐缓存放在worker侧计算
+
+> todo 后面细理为什么
+这里放在 worker 侧主要是工程与性能上的权衡：
+master 侧负责训练模型（产出 user/item 向量），而 worker 侧负责用向量生成用户级推荐缓存，职责分离。
+推荐缓存是按用户批量生成，更适合 worker 并行做（parallel.Detachable），扩展性更好。
+避免 master 负载过高：master 还要做训练、任务调度、全局计算，挪到 worker 能分散压力。
+worker 更贴近推荐缓存写入路径，写 cache 更直接。
+这样也方便按需重算（比如某些用户需要重算时，worker 可以局部跑）。
+所以：master 产向量，worker 用向量生成 CF 推荐缓存，这是刻意的架构分工。
