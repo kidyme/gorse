@@ -261,16 +261,27 @@ func (fs *SinglePageAppFileSystem) Open(name string) (http.File, error) {
 func (m *Master) StartHttpServer() {
 	m.CreateWebService()
 	container := restful.NewContainer()
+	// 仪表盘 SPA 入口
 	container.Handle("/", http.HandlerFunc(m.dashboard))
+	// 登录入口（表单/跳转）
 	container.Handle("/login", http.HandlerFunc(m.login))
+	// 登出入口（清理会话）
 	container.Handle("/logout", http.HandlerFunc(m.logout))
+	// OAuth2 回调（OIDC 登录完成后回跳）
 	container.Handle("/callback/oauth2", http.HandlerFunc(m.handleOAuth2Callback))
+	// 管理维护：清理过期数据/缓存
 	container.Handle("/api/purge", http.HandlerFunc(m.purge))
+	// 批量导入/导出用户数据
 	container.Handle("/api/bulk/users", http.HandlerFunc(m.importExportUsers))
+	// 批量导入/导出物品数据
 	container.Handle("/api/bulk/items", http.HandlerFunc(m.importExportItems))
+	// 批量导入/导出反馈数据
 	container.Handle("/api/bulk/feedback", http.HandlerFunc(m.importExportFeedback))
+	// 导出全量数据快照
 	container.Handle("/api/dump", http.HandlerFunc(m.dump))
+	// 导入全量数据快照
 	container.Handle("/api/restore", http.HandlerFunc(m.restore))
+	// 对话式推荐/排序接口
 	container.Handle("/api/chat", http.HandlerFunc(m.chat))
 	m.RestServer.StartHttpServer(container)
 }

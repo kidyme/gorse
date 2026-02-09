@@ -187,6 +187,8 @@ func (m *Master) Serve() {
 	}
 
 	// load recommend config
+	// 推荐系统的运行配置，包括：缓存、上下文、数据源、推荐算法、训练、评估、放回等 (注意，前面的datapts、cacheOps是连接配置，不属于这里的运行时配置)
+	// 尝试从 meta 里读取推荐配置；如果 key 不存在，就继续用文件配置
 	metaStr, err := m.metaStore.Get(meta.RECOMMEND_CONFIG)
 	if err != nil && !errors.Is(err, errors.NotFound) {
 		log.Logger().Error("failed to load recommend config", zap.Error(err))
@@ -198,6 +200,7 @@ func (m *Master) Serve() {
 	}
 
 	// load collective filtering model meta
+	// CF 协同过滤模型参数
 	metaStr, err = m.metaStore.Get(meta.COLLABORATIVE_FILTERING_MODEL)
 	if err != nil && !errors.Is(err, errors.NotFound) {
 		log.Logger().Error("failed to load collaborative filtering meta", zap.Error(err))
@@ -213,6 +216,7 @@ func (m *Master) Serve() {
 	}
 
 	// load click-through rate model
+	// CTR模型参数
 	metaStr, err = m.metaStore.Get(meta.CLICK_THROUGH_RATE_MODEL)
 	if err != nil && !errors.Is(err, errors.NotFound) {
 		log.Logger().Error("failed to load click-through rate meta", zap.Error(err))
@@ -230,6 +234,9 @@ func (m *Master) Serve() {
 	go m.RunTasksLoop()
 
 	// start rpc server
+	// 启动grpc
+	// masterServer、cacheStoreServer、dataStoreServer、blobStoreServer
+	// 服务方法可在对应的pb里看
 	go func() {
 		log.Logger().Info("start rpc server",
 			zap.String("host", m.Config.Master.Host),
@@ -283,6 +290,7 @@ func (m *Master) Serve() {
 	}
 
 	// start http server
+	// 启动http
 	m.StartHttpServer()
 }
 

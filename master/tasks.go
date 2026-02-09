@@ -207,42 +207,54 @@ func (m *Master) loadDataset(parent context.Context) (datasets Datasets, err err
 
 // runLoadDatasetTask loads dataset.
 func (m *Master) runLoadDatasetTask(ctx context.Context) error {
+	// 加载数据集
 	datasets, err := m.loadDataset(ctx)
 	if err != nil {
 		return errors.Trace(err)
 	}
 	useCollaborativeFilteringTasks := !strings.EqualFold(m.Config.Recommend.Collaborative.Type, "none")
 	useClickThroughRateTasks := strings.EqualFold(m.Config.Recommend.Ranker.Type, "fm")
+
+	// 更新user2user推荐器
 	if err = m.updateUserToUser(ctx, datasets.rankingDataset); err != nil {
 		log.Logger().Error("failed to update user-to-user recommendation", zap.Error(err))
 	}
+
+	// 更新item2item推荐器
 	if err = m.updateItemToItem(ctx, datasets.rankingDataset); err != nil {
 		log.Logger().Error("failed to update item-to-item recommendation", zap.Error(err))
 	}
 	if useCollaborativeFilteringTasks {
+		// 训练CF模型
 		if err = m.trainCollaborativeFiltering(ctx, datasets.rankingTrainSet, datasets.rankingTestSet); err != nil {
 			log.Logger().Error("failed to train collaborative filtering model", zap.Error(err))
 		}
 	}
 	if useClickThroughRateTasks {
+		// 训练CTR模型
 		if err = m.trainClickThroughRatePrediction(ctx, datasets.clickTrainSet, datasets.clickTestSet); err != nil {
 			log.Logger().Error("failed to train click-through rate prediction model", zap.Error(err))
 		}
 	}
 	if m.standalone {
+		// 更新推荐结果
 		if err = m.updateRecommend(ctx); err != nil {
 			log.Logger().Error("failed to update recommendation", zap.Error(err))
 		}
 	}
+
+	// GC
 	if err = m.collectGarbage(ctx, datasets.rankingDataset); err != nil {
 		log.Logger().Error("failed to collect garbage in cache", zap.Error(err))
 	}
 	if useCollaborativeFilteringTasks && m.Config.Recommend.Collaborative.OptimizePeriod > 0 {
+		// 优化CF模型
 		if err = m.optimizeCollaborativeFiltering(ctx, datasets.rankingTrainSet, datasets.rankingTestSet); err != nil {
 			log.Logger().Error("failed to optimize collaborative filtering model", zap.Error(err))
 		}
 	}
 	if useClickThroughRateTasks && m.Config.Recommend.Ranker.OptimizePeriod > 0 {
+		// 优化CTR模型
 		if err = m.optimizeClickThroughRatePrediction(ctx, datasets.clickTrainSet, datasets.clickTestSet); err != nil {
 			log.Logger().Error("failed to optimize click-through rate prediction model", zap.Error(err))
 		}
