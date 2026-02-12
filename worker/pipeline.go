@@ -171,6 +171,7 @@ func (p *Pipeline) Recommend(ctx context.Context, users []data.User, progress fu
 			return
 		}
 
+		// 过滤不存在的物品
 		candidates := make([]cache.Score, 0, len(scores))
 		candidateSet := mapset.NewSet[string]()
 		// 批量拉取候选物品的元数据，用于过滤不存在的物品
